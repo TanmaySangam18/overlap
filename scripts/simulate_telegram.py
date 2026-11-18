@@ -150,9 +150,12 @@ send(callback(SARAH, "Sarah", f"review:{PETER_HASH[:16]}:confirmed"),
 assert bot_said(SARAH, "Alerts on for this match")
 
 sarah_owner = store.owner_id_for_address("telegram", str(SARAH))
-match = client.get(f"/matches/{MATCH_ID}", params={"owner_id": sarah_owner}).json()
+sarah_headers = {"X-Overlap-Token": store.create_ingest_token(sarah_owner)}
+match = client.get(f"/matches/{MATCH_ID}", params={"owner_id": sarah_owner},
+                   headers=sarah_headers).json()
 assert match["your_review"] == "confirmed", match
-alert = client.post(f"/matches/{MATCH_ID}/alert", json={"owner_id": sarah_owner})
+alert = client.post(f"/matches/{MATCH_ID}/alert", json={"owner_id": sarah_owner},
+                    headers=sarah_headers)
 assert alert.status_code == 201, alert.text
 print("\n--- Review gate verified through the API: confirmed review, alert recorded.")
 
