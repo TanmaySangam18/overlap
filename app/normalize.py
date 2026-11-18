@@ -1,12 +1,32 @@
 """Sender identifier normalization and privacy-preserving matching keys.
 
 The raw identifier is canonicalized (so the same person written different
-ways produces the same value), then hashed with SHA-256. Only the hash and a
-masked display form are stored; matching happens on the hash.
+ways produces the same value), then hashed. Only the hash and a masked
+display form are stored; matching happens on the hash.
+
+In production the hash is an HMAC-SHA256 keyed with OVERLAP_HASH_PEPPER
+(a server-side secret): the phone-number space is small enough that a
+plain SHA-256 of a number is brute-forceable, so an unkeyed hash is
+effectively the number. The pepper keeps cross-user matching intact
+(every owner hashes under the same key) while making the stored hash
+useless to anyone who doesn't hold the secret. Without the env var
+(local dev / tests) the digest falls back to plain SHA-256.
 """
 
 import hashlib
+import hmac
+import os
 import re
+
+
+def digest_for(value: str) -> str:
+    """The matching digest for a canonical value (peppered in prod)."""
+    pepper = os.environ.get("OVERLAP_HASH_PEPPER", "")
+    if pepper:
+        return hmac.new(
+            pepper.encode("utf-8"), value.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def normalize_identifier(raw: str) -> dict:
@@ -24,7 +44,7 @@ def normalize_identifier(raw: str) -> dict:
         if not digits:
             raise ValueError("invalid telegram identifier")
         canonical = f"telegram:{digits}"
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        digest = digest_for(canonical)
         return {
             "type": "telegram",
             "canonical": canonical,
@@ -37,7 +57,7 @@ def normalize_identifier(raw: str) -> dict:
     else:
         canonical = _normalize_phone(value)
         kind = "phone"
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    digest = digest_for(canonical)
     return {
         "type": kind,
         "canonical": canonical,

@@ -163,6 +163,12 @@ def _db_path() -> str:
 def _connect():
     conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
+    # WAL lets webhook readers and writers overlap instead of locking
+    # each other out; busy_timeout makes a contended writer wait
+    # briefly rather than fail the webhook with "database is locked".
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         conn.executescript(_SCHEMA)
         _migrate(conn)
@@ -185,6 +191,9 @@ def _migrate(conn):
         conn.execute("ALTER TABLE signals ADD COLUMN prev_hash TEXT")
     if "chain_hash" not in cols:
         conn.execute("ALTER TABLE signals ADD COLUMN chain_hash TEXT")
+    user_cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_users)")}
+    if "last_inbound_at" not in user_cols:
+        conn.execute("ALTER TABLE chat_users ADD COLUMN last_inbound_at TEXT")
 
 
 def add_signal(owner_id, source, conversation_id, ident, message_text, sent_at_iso):
@@ -393,14 +402,39 @@ def owner_for_token(token):
 # Chat-agent storage
 # ---------------------------------------------------------------------------
 
-import hashlib as _hashlib
 import json as _json
 
 
 def owner_id_for_address(channel: str, address: str) -> str:
-    """Deterministic owner id for a chat user, derived from their address."""
-    digest = _hashlib.sha256(f"{channel}:{address}".encode("utf-8")).hexdigest()
-    return "u_" + digest[:16]
+    """Deterministic owner id for a chat user, derived from their address.
+
+    Uses the same peppered digest as identifier matching (see
+    app/normalize.py): in production an owner id cannot be computed
+    from a phone number by anyone who doesn't hold the pepper.
+    """
+    from .normalize import digest_for
+
+    return "u_" + digest_for(f"{channel}:{address}")[:16]
+
+
+def touch_inbound(owner_id):
+    """Record that this chat user just messaged us (drives the
+    WhatsApp 24-hour window check for outbound notices)."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE chat_users SET last_inbound_at = datetime('now') WHERE owner_id = ?",
+            (owner_id,),
+        )
+
+
+def last_inbound_at(owner_id):
+    """ISO timestamp of the user's last inbound message, or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT last_inbound_at FROM chat_users WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+    return row["last_inbound_at"] if row else None
 
 
 def get_or_create_chat_user(channel, address, display_name=None):
@@ -640,7 +674,15 @@ def delete_last_signal(owner_id, identifier_hash=None):
 
 
 def add_notice(owner_id, notice_key):
-    """Record that a notice was sent. Returns True the first time only."""
+    """Record that a notice was QUEUED for this owner (dedupe gate).
+
+    Returns True the first time only. Delivery itself is tracked by
+    the outbox row: a notice counts as delivered only when its outbox
+    row is marked sent after a successful transport send — and on
+    WhatsApp, sends are only attempted inside the 24-hour window, so
+    a queued notice waits for the user's next message rather than
+    being attempted (and rejected by Meta) out of window.
+    """
     with _connect() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO notice_log (owner_id, notice_key) VALUES (?, ?)",
@@ -714,6 +756,7 @@ def delete_owner_data(owner_id):
             "ingested_keys",
             "notice_log",
             "outbox",
+            "ingest_tokens",
         ):
             conn.execute(f"DELETE FROM {table} WHERE owner_id = ?", (owner_id,))
         conn.execute("DELETE FROM reviews WHERE owner_id = ?", (owner_id,))

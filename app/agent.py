@@ -41,6 +41,34 @@ _DONE_BUTTON = {"id": "onboarding:done", "title": "Done — that's all"}
 _YES = {"yes", "agree", "ok", "okay", "yes please", "turn it on"}
 
 
+def _scrub_text(text):
+    """Cap staged text at snippet length.
+
+    Agent state is working storage, not an archive: the privacy
+    promise is snippets only, so anything staged in context (a burst
+    awaiting attribution, a parsed export awaiting a contact card, a
+    pasted chat awaiting a Log-it tap) is truncated to the same 80
+    characters the signal store itself would keep.
+    """
+    return (text or "")[: store.SNIPPET_LEN]
+
+
+def _scrub_lines(text):
+    """Line-wise snippet cap for staged pastes (keeps the line
+    structure the paste parser reads: labels and timestamps lead)."""
+    return "\n".join(
+        line[: store.SNIPPET_LEN] for line in (text or "").splitlines()
+    )
+
+
+def _scrub_parsed(parsed):
+    out = dict(parsed)
+    out["messages"] = [
+        {**m, "text": _scrub_text(m.get("text"))} for m in parsed.get("messages", [])
+    ]
+    return out
+
+
 def _norm(text):
     """Normalize a typed command for intent matching.
 
@@ -70,8 +98,12 @@ _UNDO_WORDS = {
     "undo", "undo last", "undo that", "delete last", "remove last",
     "delete that", "remove that", "take that back",
 }
-_PAUSE_WORDS = {"pause", "pause watching", "stop watching", "stop"}
+_PAUSE_WORDS = {"pause", "pause watching", "stop watching"}
 _RESUME_WORDS = {"resume", "resume watching", "start watching", "unpause"}
+# STOP is a real opt-out, not a pause (carrier/Meta convention): total
+# silence — nothing logged, no replies, no notices — until START.
+_STOP_WORDS = {"stop", "unsubscribe", "opt out", "stop messages", "end"}
+_START_WORDS = {"start", "subscribe", "opt in", "resume", "start watching"}
 _FORGET_WORDS = {
     "forget me", "delete my data", "delete everything",
     "forget everything", "delete me",
@@ -277,6 +309,37 @@ def _finish_onboarding(owner_id):
 
 
 def _consented(owner_id, user, ev):
+    # Opt-out gate: a user who said STOP gets total silence — nothing
+    # logged, no replies, no notices — until they say START. 'forget
+    # me' still works while opted out (deletion must always be
+    # reachable).
+    gate_state = store.get_agent_state(owner_id)
+    if gate_state["context"].get("opted_out"):
+        cmd = (
+            _norm(ev.get("text") or "")
+            if ev["kind"] in ("text", "forwarded")
+            else ""
+        )
+        if cmd in _FORGET_WORDS:
+            store.delete_owner_data(owner_id)
+            return [
+                {
+                    "text": "Done — everything I held for you is deleted.",
+                    "buttons": [],
+                }
+            ]
+        if cmd in _START_WORDS:
+            ctx = gate_state["context"]
+            ctx["opted_out"] = False
+            store.set_agent_state(owner_id, "idle", ctx)
+            return [
+                {
+                    "text": "You're back in ✓ Forward messages whenever — "
+                    "or say 'status' to see what I'm watching.",
+                    "buttons": [],
+                }
+            ]
+        return []
     kind = ev["kind"]
     if kind == "button":
         return _handle_button(owner_id, ev.get("button_id") or "")
@@ -313,6 +376,20 @@ def _consented(owner_id, user, ev):
         return [_evidence_report(owner_id)]
     if cmd in _UNDO_WORDS or cmd.startswith(("undo ", "delete last for ", "remove last for ")):
         return _undo_last(owner_id, cmd)
+    if cmd in _STOP_WORDS:
+        ctx["opted_out"] = True
+        ctx["pending"] = []
+        ctx.pop("pending_paste", None)
+        store.set_agent_state(owner_id, "idle", ctx)
+        return [
+            {
+                "text": "Done — you're opted out. I won't log anything or "
+                "message you again unless you say 'start'. Your saved "
+                "people and history stay as they are; say 'forget me' "
+                "any time to delete everything.",
+                "buttons": [],
+            }
+        ]
     if cmd in _RESUME_WORDS:
         ctx["paused"] = False
         store.set_agent_state(owner_id, state["state"], ctx)
@@ -345,8 +422,8 @@ def _consented(owner_id, user, ev):
                     "log forwards, exports and screenshots.\n"
                     "Say 'status' for what I'm watching, 'activity' for your "
                     "latest entries, 'undo' to remove the last one, 'pause' "
-                    "to stop logging for a while, 'forget me' to delete "
-                    "your data."
+                    "to stop logging for a while, 'stop' to opt out "
+                    "completely, 'forget me' to delete your data."
                 ),
                 "buttons": [],
             }
@@ -408,7 +485,7 @@ def _conversation(owner_id, ev):
     ctx = state["context"]
     if _looks_like_chat(text):
         ctx["pending_paste"] = {
-            "text": text,
+            "text": _scrub_lines(text),
             "sent_at": ev.get("sent_at") or _now().isoformat(),
             "channel": ev["channel"],
         }
@@ -713,7 +790,10 @@ def _submit_message(owner_id, ev):
     ctx["channel"] = ev["channel"]
     pending = ctx.get("pending", [])
     pending.append(
-        {"text": ev.get("text") or "", "sent_at": ev.get("sent_at") or _now().isoformat()}
+        {
+            "text": _scrub_text(ev.get("text")),
+            "sent_at": ev.get("sent_at") or _now().isoformat(),
+        }
     )
     ctx["pending"] = pending
 
@@ -821,7 +901,7 @@ def _route_parsed_export(owner_id, user, parsed):
         state = store.get_agent_state(owner_id)
         ctx = state["context"]
         ctx["pending_export_names"] = names
-        ctx["pending_export_parsed"] = parsed
+        ctx["pending_export_parsed"] = _scrub_parsed(parsed)
         store.set_agent_state(owner_id, "awaiting_whoami", ctx)
         listed = " / ".join(names)
         return [
@@ -847,7 +927,7 @@ def _route_parsed_export(owner_id, user, parsed):
         ctx = state["context"]
         ctx["pending_export"] = {
             "partner_name": partner_name,
-            "parsed": parsed,
+            "parsed": _scrub_parsed(parsed),
         }
         store.set_agent_state(owner_id, "awaiting_contact_for_export", ctx)
         return [
@@ -1044,7 +1124,11 @@ def ingest_screenshot_for_api(owner_id, ocr_text, source_app=None):
     pending = ctx.get("pending", [])
     for msg in parsed["messages"]:
         pending.append(
-            {"text": msg["text"], "sent_at": msg["sent_at"], "source": "screenshot"}
+            {
+                "text": _scrub_text(msg["text"]),
+                "sent_at": msg["sent_at"],
+                "source": "screenshot",
+            }
         )
     ctx["pending"] = pending
     store.set_agent_state(owner_id, "awaiting_attribution", ctx)
@@ -1084,6 +1168,10 @@ def ingest_screenshot_for_api(owner_id, ocr_text, source_app=None):
 # ---------------------------------------------------------------------------
 
 
+def _is_opted_out(owner_id):
+    return bool(store.get_agent_state(owner_id)["context"].get("opted_out"))
+
+
 def _match_notice(owner_id, ident):
     signals = store.signals_for_hash(ident["hash"])
     owners = {s["owner_id"] for s in signals}
@@ -1097,7 +1185,11 @@ def _match_notice(owner_id, ident):
     # their matches list as before.
     for other in owners - {owner_id}:
         chat_user = store.get_chat_user(other)
-        if chat_user and store.add_notice(other, f"match:{ident['hash'][:16]}"):
+        if (
+            chat_user
+            and not _is_opted_out(other)
+            and store.add_notice(other, f"match:{ident['hash'][:16]}")
+        ):
             store.enqueue_outbox(
                 other,
                 chat_user["channel"],
@@ -1152,6 +1244,8 @@ def _flag_checks_for_others(submitter_owner_id, ident):
     signals = store.signals_for_hash(ident["hash"])
     owners = {s["owner_id"] for s in signals} - {submitter_owner_id}
     for other in owners:
+        if _is_opted_out(other):
+            continue
         person = store.person_by_hash(other, ident["hash"])
         if person is None:
             continue

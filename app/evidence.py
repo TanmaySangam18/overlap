@@ -318,6 +318,12 @@ def verify_pack(pack):
     anchor_status is read from the pack's own anchor records:
     'anchored' if any was submitted to the calendar, 'pending' if
     records exist but none got through, 'none' if the pack has none.
+
+    HONESTY RULE: that status is SELF-REPORTED by the pack. This
+    function recomputes the hash chain (that part is proven), but it
+    cannot verify an OpenTimestamps submission — the proof bytes are
+    not checked here — so anchor_verified is always False and no
+    surface may present the anchor as proven on this function's word.
     """
     try:
         entries = pack["entries"]
@@ -326,7 +332,12 @@ def verify_pack(pack):
         if not isinstance(entries, list):
             raise ValueError("entries must be a list")
     except (KeyError, TypeError, ValueError, AttributeError):
-        return {"chain_intact": False, "entries_checked": 0, "anchor_status": "none"}
+        return {
+            "chain_intact": False,
+            "entries_checked": 0,
+            "anchor_status": "none",
+            "anchor_verified": False,
+        }
 
     if entries and all(isinstance(e.get("id"), int) for e in entries):
         entries = sorted(entries, key=lambda e: e["id"])
@@ -362,6 +373,7 @@ def verify_pack(pack):
         "chain_intact": intact,
         "entries_checked": checked,
         "anchor_status": anchor_status,
+        "anchor_verified": False,
     }
 
 
@@ -428,9 +440,9 @@ document.getElementById('go').addEventListener('click', async () => {
     lines.push('✗ <b>This pack does not verify.</b> At least one entry was changed after the fact (' + r.entries_checked + ' entries checked, up to the break).');
   }
   if (r.anchor_status === 'anchored') {
-    lines.push('Timestamp anchor: ✓ submitted to a public timestamp calendar — the chain provably existed at that time.');
+    lines.push('Timestamp anchor: this pack <b>reports</b> a submission to a public timestamp calendar. This page cannot independently verify that submission — what is proven here is the hash chain above.');
   } else if (r.anchor_status === 'pending') {
-    lines.push('Timestamp anchor: recorded, submission to the public calendar still pending.');
+    lines.push('Timestamp anchor: recorded in the pack, submission to the public calendar still pending.');
   } else {
     lines.push('Timestamp anchor: none in this pack yet.');
   }

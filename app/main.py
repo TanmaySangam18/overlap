@@ -73,6 +73,47 @@ app.include_router(sms_router)
 app.include_router(telegram_router)
 
 
+# --- Daily maintenance ---------------------------------------------------
+# Two jobs used to exist only as operator scripts, which meant they
+# never ran in production: the retention purge (privacy promise) and
+# the evidence-chain timestamp anchor. They now run in-process: once
+# shortly after boot, then every 24h. Both are idempotent and failure-
+# tolerant (a failed anchor submission stays pending and retries on
+# the next run; the purge is a no-op unless OVERLAP_RETENTION_DAYS is
+# set). OVERLAP_MAINTENANCE_OFF=1 disables the loop (tests, scripts).
+
+
+def _run_maintenance_once() -> dict:
+    result = {}
+    try:
+        result["purge"] = store.purge_old()
+    except Exception as exc:  # never let maintenance kill the loop
+        result["purge_error"] = str(exc)
+    try:
+        anchor = evidence.run_anchor()
+        result["anchor"] = {
+            "root": anchor["root"],
+            "attempts": len(anchor["attempts"]),
+        }
+    except Exception as exc:
+        result["anchor_error"] = str(exc)
+    return result
+
+
+@app.on_event("startup")
+async def _start_maintenance() -> None:
+    if os.environ.get("OVERLAP_MAINTENANCE_OFF"):
+        return
+    import asyncio
+
+    async def loop() -> None:
+        while True:
+            await asyncio.to_thread(_run_maintenance_once)
+            await asyncio.sleep(24 * 3600)
+
+    asyncio.create_task(loop())
+
+
 # --- Owner-scoped API authorization -------------------------------------
 # The REST endpoints that read or write one owner's data (/signals,
 # /matches...) are NOT public surface. Owner ids are derivable (chat
@@ -733,7 +774,12 @@ async def verify_evidence_pack(request: Request):
     except Exception:
         pack = None
     if not isinstance(pack, dict):
-        return {"chain_intact": False, "entries_checked": 0, "anchor_status": "none"}
+        return {
+            "chain_intact": False,
+            "entries_checked": 0,
+            "anchor_status": "none",
+            "anchor_verified": False,
+        }
     return evidence.verify_pack(pack)
 
 

@@ -143,6 +143,19 @@ def send_message(to_wa_id: str, text: str, buttons=None) -> dict:
     return {"to": to_wa_id, "text": text, "buttons": buttons, "result": result}
 
 
+def _in_window(owner_id: str) -> bool:
+    """True when the user's last inbound message is < 24h old."""
+    ts = store.last_inbound_at(owner_id)
+    if not ts:
+        return False
+    try:
+        last = datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return (now - last).total_seconds() < 24 * 3600
+
+
 def _iso_from_epoch(ts) -> str:
     try:
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
@@ -339,6 +352,7 @@ async def receive(request: Request):
             send_message(ev["address"], guidance)
             continue
         owner_id = store.owner_id_for_address("whatsapp", ev["address"])
+        store.touch_inbound(owner_id)
         for reply in agent.handle_event(ev):
             try:
                 send_message(ev["address"], reply["text"], reply.get("buttons"))
@@ -353,7 +367,17 @@ async def receive(request: Request):
     # Deliver anything the agent owes other users (match/flag notices).
     # Peek + mark-after-send: a failed send stays queued for next time
     # instead of being marked sent and lost.
+    #
+    # WINDOW RULE (Meta policy): free-form messages may only be sent
+    # within 24 hours of the recipient's last inbound message. Outside
+    # the window Meta rejects the send (error 131047) — and attempting
+    # it anyway is a policy violation. So out-of-window rows are HELD,
+    # untouched, until that user messages again (which reopens their
+    # window and drains their notice in the same request). Out-of-window
+    # delivery would need an approved utility template — a later phase.
     for row in store.peek_outbox(channel="whatsapp"):
+        if not _in_window(row["owner_id"]):
+            continue
         try:
             send_message(row["address"], row["text"], row["buttons"])
         except Exception:
