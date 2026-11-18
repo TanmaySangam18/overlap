@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from . import agent, evidence, export_parser, flagging, legal, ratelimit, store
 from .normalize import normalize_identifier
+from .sendblue import router as sendblue_router
 from .sms import router as sms_router
 from .telegram import router as telegram_router
 from .whatsapp import router as whatsapp_router
@@ -63,6 +64,7 @@ app = FastAPI(
     openapi_url=None if _PROD else "/openapi.json",
 )
 app.include_router(whatsapp_router)
+app.include_router(sendblue_router)
 app.include_router(sms_router)
 app.include_router(telegram_router)
 
