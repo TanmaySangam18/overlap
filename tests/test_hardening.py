@@ -324,5 +324,29 @@ def test_prod_mode_disables_docs(tmp_path):
     assert "prod-ok" in r.stdout
 
 
-def test_dev_mode_docs_available():
-    assert client.get("/docs").status_code == 200
+def test_dev_mode_docs_available(tmp_path):
+    # Docs are served ONLY under an explicit OVERLAP_ENV=dev; the
+    # default environment (this test process) must not serve them.
+    assert client.get("/docs").status_code == 404
+    env = dict(
+        os.environ,
+        OVERLAP_ENV="dev",
+        OVERLAP_DB_PATH=str(tmp_path / "dev-mode.db"),
+    )
+    code = (
+        "from fastapi.testclient import TestClient;"
+        "from app.main import app;"
+        "c = TestClient(app);"
+        "assert c.get('/docs').status_code == 200;"
+        "assert c.get('/openapi.json').status_code == 200;"
+        "print('dev-ok')"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=PROJECT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "dev-ok" in r.stdout
