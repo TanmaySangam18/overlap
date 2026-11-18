@@ -332,6 +332,7 @@ def test_verify_roundtrip_and_tampered_pack_fails():
         "chain_intact": False,
         "entries_checked": 0,
         "anchor_status": "none",
+        "anchor_verified": False,
     }
 
 

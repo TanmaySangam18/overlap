@@ -12,6 +12,10 @@ unauthenticated and wrong-credential paths.
 import os
 
 os.environ.setdefault("OVERLAP_API_TOKEN", "test-operator-token")
+# The app's daily maintenance loop (retention purge + timestamp
+# anchoring) must never run during tests: anchoring makes a real
+# network call and would mutate fixture databases nondeterministically.
+os.environ.setdefault("OVERLAP_MAINTENANCE_OFF", "1")
 
 import fastapi.testclient as _ftc
 
