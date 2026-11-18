@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from . import agent, evidence, export_parser, flagging, legal, ratelimit, store
 from .normalize import normalize_identifier
+from .bluebubbles import router as bluebubbles_router
 from .sendblue import router as sendblue_router
 from .sms import router as sms_router
 from .telegram import router as telegram_router
@@ -65,6 +66,7 @@ app = FastAPI(
 )
 app.include_router(whatsapp_router)
 app.include_router(sendblue_router)
+app.include_router(bluebubbles_router)
 app.include_router(sms_router)
 app.include_router(telegram_router)
 
