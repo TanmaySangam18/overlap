@@ -21,6 +21,7 @@ Rules carried over from the core product, unchanged:
 - The other submitting user is never identified.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from . import events as events_mod
@@ -38,6 +39,37 @@ ONBOARDING_MAX_CARDS = 3
 _DONE_BUTTON = {"id": "onboarding:done", "title": "Done — that's all"}
 
 _YES = {"yes", "agree", "ok", "okay", "yes please", "turn it on"}
+
+# Plain typed text is conversation with the agent, never a log entry —
+# only forwards, exports and screenshots are evidence. These sets shape
+# the conversational replies; the chat-shape check below decides when a
+# paste looks like someone's messages and deserves a "log it?" ask.
+_ACKS = {
+    "thanks", "thank you", "ty", "ok", "okay", "cool", "great", "nice",
+    "got it", "perfect", "awesome", "👍", "🙏", "👌",
+}
+_QUESTION_STARTERS = {
+    "how", "what", "why", "when", "can", "could", "do", "does", "is",
+    "are", "should", "will", "would", "who",
+}
+_STAMP_RE = re.compile(r"^(\[\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4},?\s+\d{1,2}:\d{2})")
+_NAMED_RE = re.compile(r"^[^:\n]{1,40}:\s+\S")
+
+
+def _looks_like_chat(text):
+    """Heuristic: does this paste look like lines from someone's chat?
+
+    Long pastes, timestamped export lines, or several 'Name: message'
+    lines count. A single typed sentence never does.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= 4:
+        return True
+    if len(lines) < 2:
+        return False
+    if any(_STAMP_RE.match(ln) for ln in lines):
+        return True
+    return sum(1 for ln in lines if _NAMED_RE.match(ln)) >= 2
 
 
 def _now() -> datetime:
@@ -224,6 +256,8 @@ def _consented(owner_id, user, ev):
                     "• a contact card (attach → Contact) — once per person, ever\n"
                     "• forwarded messages from that person\n"
                     "• a chat export file for their history + baseline\n"
+                    "Anything you type to me is just conversation — I only "
+                    "log forwards, exports and screenshots.\n"
                     "Say 'status' for what I'm watching, 'forget me' to delete "
                     "your data."
                 ),
@@ -247,11 +281,85 @@ def _consented(owner_id, user, ev):
                     "buttons": [],
                 }
             ]
-    # Any other message ends onboarding implicitly — the user is already
-    # using the bot (e.g. forwarding), so don't keep prompting for cards.
-    if state["state"] == "onboarding_cards":
-        store.set_agent_state(owner_id, "idle", ctx)
-    return _submit_message(owner_id, ev)
+        if ev["kind"] == "text":
+            return [
+                {
+                    "text": "Still need the name for the messages you "
+                    "forwarded — tap a name above or reply with it. (What "
+                    "you just typed wasn't logged.)",
+                    "buttons": [],
+                }
+            ]
+    if ev["kind"] == "forwarded":
+        # A forward ends onboarding implicitly — the user is already
+        # using the bot, so don't keep prompting for cards.
+        if state["state"] == "onboarding_cards":
+            store.set_agent_state(owner_id, "idle", ctx)
+        return _submit_message(owner_id, ev)
+    # Plain typed text is the user talking to the agent. Read it, answer
+    # it — never file it as someone's messages.
+    return _conversation(owner_id, ev)
+
+
+def _conversation(owner_id, ev):
+    """Handle plain typed text: conversation only, nothing is logged.
+
+    The one exception is a paste that looks like lines from a chat —
+    that gets staged and the user is asked before anything is filed.
+    """
+    text = (ev.get("text") or "").strip()
+    low = text.lower()
+    state = store.get_agent_state(owner_id)
+    ctx = state["context"]
+    if _looks_like_chat(text):
+        ctx["pending_paste"] = {
+            "text": text,
+            "sent_at": ev.get("sent_at") or _now().isoformat(),
+            "channel": ev["channel"],
+        }
+        store.set_agent_state(owner_id, state["state"], ctx)
+        return [
+            {
+                "text": "That looks like messages from a chat, so I "
+                "haven't logged it. Want me to log it — or were you just "
+                "showing me?",
+                "buttons": [
+                    {"id": "paste:log", "title": "Log it"},
+                    {"id": "paste:talk", "title": "Just talking"},
+                ],
+            }
+        ]
+    if low in _ACKS:
+        return [
+            {
+                "text": "Anytime. Forward me their messages whenever — "
+                "or say 'status' to see what I'm watching.",
+                "buttons": [],
+            }
+        ]
+    if low.endswith("?") or (low.split(" ", 1)[0] if low else "") in _QUESTION_STARTERS:
+        return [
+            {
+                "text": "I watch what you send me: share a person's "
+                "contact card once, then forward their messages (or send "
+                "a chat export) and I log them under that person. I "
+                "compare each pair against its own baseline and flag "
+                "pattern *changes* — never verdicts — and nothing becomes "
+                "an alert without your review.\n\n"
+                "Anything you type to me is just conversation; I never "
+                "log your words as someone's messages. Say 'status' to "
+                "see what I'm watching.",
+                "buttons": [],
+            }
+        ]
+    return [
+        {
+            "text": "Read you — not logging that. I only log what you "
+            "*forward* me, plus chat exports. If those were someone's "
+            "messages, forward the originals and I'll file them properly.",
+            "buttons": [],
+        }
+    ]
 
 
 def _handle_button(owner_id, button_id):
@@ -269,6 +377,34 @@ def _handle_button(owner_id, button_id):
             return _apply_review(owner_id, parts[1], parts[2])
     if button_id == "consent:yes":
         return _pre_consent(owner_id, {"kind": "button", "button_id": "consent:yes", "text": ""})
+    if button_id == "paste:log":
+        state = store.get_agent_state(owner_id)
+        ctx = state["context"]
+        paste = ctx.pop("pending_paste", None)
+        store.set_agent_state(owner_id, state["state"], ctx)
+        if not paste:
+            return [
+                {
+                    "text": "Nothing waiting to log — paste it again and "
+                    "tap Log it.",
+                    "buttons": [],
+                }
+            ]
+        return _submit_message(
+            owner_id,
+            {
+                "channel": paste.get("channel", "whatsapp"),
+                "kind": "forwarded",
+                "text": paste["text"],
+                "sent_at": paste["sent_at"],
+            },
+        )
+    if button_id == "paste:talk":
+        state = store.get_agent_state(owner_id)
+        ctx = state["context"]
+        ctx.pop("pending_paste", None)
+        store.set_agent_state(owner_id, state["state"], ctx)
+        return [{"text": "Got it — just between us. Nothing logged.", "buttons": []}]
     return [{"text": "Got it.", "buttons": []}]
 
 
