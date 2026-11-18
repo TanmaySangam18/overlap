@@ -24,3 +24,9 @@ services:
         sync: false
       - key: SENDBLUE_WEBHOOK_SECRET
         sync: false
+      - key: BLUEBUBBLES_SERVER_URL
+        sync: false
+      - key: BLUEBUBBLES_PASSWORD
+        sync: false
+      - key: BLUEBUBBLES_WEBHOOK_SECRET
+        sync: false
