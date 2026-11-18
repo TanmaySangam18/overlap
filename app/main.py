@@ -15,6 +15,7 @@ never messages third parties about a match. Alerts are internal records
 that can only be created after the user explicitly reviews and confirms.
 """
 
+import hmac
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,10 +45,11 @@ _WEB_INDEX = Path(__file__).resolve().parent.parent / "web" / "index.html"
 
 DISCLAIMER = "A potential overlap is not proof of a relationship or misconduct."
 
-# Production (OVERLAP_ENV=prod) turns off the interactive docs and the
-# OpenAPI schema: the public surface is the site, the legal pages, and
-# the webhooks — not an API explorer.
-_PROD = os.environ.get("OVERLAP_ENV") == "prod"
+# The interactive docs and OpenAPI schema are a DEV convenience only:
+# they are served solely when OVERLAP_ENV=dev is set explicitly. In
+# every other environment (including a misconfigured one) the public
+# surface is the site, the legal pages, and the webhooks — fail closed.
+_DEV = os.environ.get("OVERLAP_ENV") == "dev"
 
 app = FastAPI(
     title="OVERLAP",
@@ -60,15 +62,45 @@ app = FastAPI(
         "not send them; the Telegram client reads only the account its "
         "owner logged into, with that owner's consent."
     ),
-    docs_url=None if _PROD else "/docs",
-    redoc_url=None if _PROD else "/redoc",
-    openapi_url=None if _PROD else "/openapi.json",
+    docs_url="/docs" if _DEV else None,
+    redoc_url="/redoc" if _DEV else None,
+    openapi_url="/openapi.json" if _DEV else None,
 )
 app.include_router(whatsapp_router)
 app.include_router(sendblue_router)
 app.include_router(bluebubbles_router)
 app.include_router(sms_router)
 app.include_router(telegram_router)
+
+
+# --- Owner-scoped API authorization -------------------------------------
+# The REST endpoints that read or write one owner's data (/signals,
+# /matches...) are NOT public surface. Owner ids are derivable (chat
+# owner ids are a truncated hash of channel:address), so possession of
+# an owner id proves nothing. Access requires either the operator
+# token (OVERLAP_API_TOKEN, header X-Overlap-Admin) or a valid ingest
+# token belonging to that owner (header X-Overlap-Token) — the same
+# credential the ingest endpoints already use.
+
+
+def _api_token() -> str:
+    return os.environ.get("OVERLAP_API_TOKEN", "")
+
+
+def _is_admin(provided: str) -> bool:
+    expected = _api_token()
+    return bool(expected) and bool(provided) and hmac.compare_digest(provided, expected)
+
+
+def _authorize_owner(owner_id: str, x_overlap_token: str, x_overlap_admin: str) -> None:
+    if _is_admin(x_overlap_admin):
+        return
+    if x_overlap_token and store.owner_for_token(x_overlap_token) == owner_id:
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="A valid ingest token for this owner, or the operator token, is required.",
+    )
 
 
 @app.middleware("http")
@@ -202,13 +234,18 @@ def root():
     return {
         "service": "OVERLAP",
         "status": "ok",
-        "docs": "/docs",
+        "docs": "/docs" if _DEV else None,
         "disclaimer": DISCLAIMER,
     }
 
 
 @app.post("/signals", status_code=201)
-def submit_signal(payload: SignalIn):
+def submit_signal(
+    payload: SignalIn,
+    x_overlap_token: str = Header(default=""),
+    x_overlap_admin: str = Header(default=""),
+):
+    _authorize_owner(payload.owner_id, x_overlap_token, x_overlap_admin)
     if not payload.consent_confirmed:
         raise HTTPException(
             status_code=400,
@@ -236,12 +273,24 @@ def submit_signal(payload: SignalIn):
 
 
 @app.post("/tokens", status_code=201)
-def create_ingest_token(payload: TokenIn):
+def create_ingest_token(
+    payload: TokenIn,
+    x_overlap_admin: str = Header(default=""),
+):
     """Issue the personal token a user's iOS Shortcuts automation presents.
 
-    Creating the token is the consent grant for automated submission: the
-    user builds the automation on their own phone and pastes the token in.
+    Operator-only: a token is a standing credential for its owner, so
+    minting one for an arbitrary owner id would be impersonation.
+    Requires OVERLAP_API_TOKEN (header X-Overlap-Admin); when the
+    operator token is not configured, minting is disabled entirely.
     """
+    if not _api_token():
+        raise HTTPException(
+            status_code=503,
+            detail="Token minting is disabled: OVERLAP_API_TOKEN is not configured.",
+        )
+    if not _is_admin(x_overlap_admin):
+        raise HTTPException(status_code=401, detail="Operator token required.")
     token = store.create_ingest_token(payload.owner_id)
     return {
         "owner_id": payload.owner_id,
@@ -404,7 +453,12 @@ def ingest_screenshot(
 
 
 @app.get("/matches")
-def list_matches(owner_id: str = Query(min_length=1)):
+def list_matches(
+    owner_id: str = Query(min_length=1),
+    x_overlap_token: str = Header(default=""),
+    x_overlap_admin: str = Header(default=""),
+):
+    _authorize_owner(owner_id, x_overlap_token, x_overlap_admin)
     matches = []
     for identifier_hash in store.hashes_for_owner(owner_id):
         match = _build_match(identifier_hash, owner_id)
@@ -414,7 +468,13 @@ def list_matches(owner_id: str = Query(min_length=1)):
 
 
 @app.get("/matches/{match_id}")
-def get_match(match_id: str, owner_id: str = Query(min_length=1)):
+def get_match(
+    match_id: str,
+    owner_id: str = Query(min_length=1),
+    x_overlap_token: str = Header(default=""),
+    x_overlap_admin: str = Header(default=""),
+):
+    _authorize_owner(owner_id, x_overlap_token, x_overlap_admin)
     identifier_hash = store.find_hash_by_match_id(match_id)
     if not identifier_hash:
         raise HTTPException(status_code=404, detail="Match not found.")
@@ -426,7 +486,13 @@ def get_match(match_id: str, owner_id: str = Query(min_length=1)):
 
 
 @app.post("/matches/{match_id}/review")
-def review_match(match_id: str, payload: ReviewIn):
+def review_match(
+    match_id: str,
+    payload: ReviewIn,
+    x_overlap_token: str = Header(default=""),
+    x_overlap_admin: str = Header(default=""),
+):
+    _authorize_owner(payload.owner_id, x_overlap_token, x_overlap_admin)
     identifier_hash = store.find_hash_by_match_id(match_id)
     if not identifier_hash:
         raise HTTPException(status_code=404, detail="Match not found.")
@@ -440,7 +506,13 @@ def review_match(match_id: str, payload: ReviewIn):
 
 
 @app.post("/matches/{match_id}/alert", status_code=201)
-def create_alert(match_id: str, payload: AlertIn):
+def create_alert(
+    match_id: str,
+    payload: AlertIn,
+    x_overlap_token: str = Header(default=""),
+    x_overlap_admin: str = Header(default=""),
+):
+    _authorize_owner(payload.owner_id, x_overlap_token, x_overlap_admin)
     identifier_hash = store.find_hash_by_match_id(match_id)
     if not identifier_hash:
         raise HTTPException(status_code=404, detail="Match not found.")
