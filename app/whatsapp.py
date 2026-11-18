@@ -83,6 +83,34 @@ def fetch_media_bytes(media_id: str) -> bytes:
         return resp.read()
 
 
+def _chunks(text: str, limit: int = 4096):
+    """Split a long plain-text reply into WhatsApp-sized pieces.
+
+    WhatsApp rejects text bodies over 4096 chars; a long status or
+    evidence report must arrive as a few messages, not an API error.
+    Splits on line boundaries where possible.
+    """
+    if len(text) <= limit:
+        return [text]
+    out, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                out.append(current)
+                current = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            out.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        out.append(current)
+    return out
+
+
 def send_message(to_wa_id: str, text: str, buttons=None) -> dict:
     """Send one bot message. Dry-run (logged) unless live-configured."""
     buttons = [b for b in (buttons or []) if b.get("id") and b.get("title")]
@@ -106,9 +134,12 @@ def send_message(to_wa_id: str, text: str, buttons=None) -> dict:
                 ]
             },
         }
-    else:
-        payload["text"] = {"body": text}
-    result = _graph_post(f"{_phone_number_id()}/messages", payload)
+        result = _graph_post(f"{_phone_number_id()}/messages", payload)
+        return {"to": to_wa_id, "text": text, "buttons": buttons, "result": result}
+    result = None
+    for chunk in _chunks(text):
+        payload["text"] = {"body": chunk}
+        result = _graph_post(f"{_phone_number_id()}/messages", payload)
     return {"to": to_wa_id, "text": text, "buttons": buttons, "result": result}
 
 
@@ -130,10 +161,29 @@ def _events_from_payload(payload: dict):
                 for c in value.get("contacts", [])
             }
             for msg in value.get("messages", []):
-                ev = _event_from_message(msg, profiles)
-                if ev:
-                    events.append(ev)
+                events.extend(_events_from_message(msg, profiles))
     return events
+
+
+def _events_from_message(msg: dict, profiles: dict):
+    """One payload message -> one or more agent events.
+
+    A contacts message can carry several cards at once (onboarding
+    asks for up to 3 people) — each card becomes its own event with a
+    suffixed message id, so webhook dedupe doesn't swallow cards 2+.
+    """
+    if msg.get("type") == "contacts" and len(msg.get("contacts") or []) > 1:
+        out = []
+        for idx, card in enumerate(msg["contacts"]):
+            single = dict(msg)
+            single["contacts"] = [card]
+            ev = _event_from_message(single, profiles)
+            if ev:
+                ev["message_id"] = f"{msg.get('id')}#card{idx}"
+                out.append(ev)
+        return out
+    ev = _event_from_message(msg, profiles)
+    return [ev] if ev else []
 
 
 def _event_from_message(msg: dict, profiles: dict):
@@ -193,7 +243,13 @@ def _event_from_message(msg: dict, profiles: dict):
         base["button_id"] = (msg.get("button") or {}).get("payload", "")
         base["text"] = (msg.get("button") or {}).get("text", "")
         return base
-    return None  # reactions, stickers, statuses, etc. are not agent input
+    if mtype in ("image", "audio", "video", "sticker", "location"):
+        # Not agent input — but silence feels broken. The webhook
+        # answers with one line of guidance instead of nothing.
+        base["kind"] = "text"
+        base["unsupported_message"] = mtype
+        return base
+    return None  # reactions, statuses, etc. are not agent input
 
 
 @router.get("/webhooks/whatsapp")
@@ -268,9 +324,39 @@ async def receive(request: Request):
                 "don't tell me anything.",
             )
             continue
+        if ev.get("unsupported_message"):
+            guidance = {
+                "image": "I got the image, but I can't read screenshots "
+                "inside WhatsApp — paste the text, forward the messages, "
+                "or use the screenshot Shortcut from your Photos app.",
+                "audio": "I can't listen to voice notes yet — forward me "
+                "the messages as text and I'll log them.",
+            }.get(
+                ev["unsupported_message"],
+                "I can work with text, forwards, contact cards and chat "
+                "exports — that kind of message doesn't tell me anything.",
+            )
+            send_message(ev["address"], guidance)
+            continue
+        owner_id = store.owner_id_for_address("whatsapp", ev["address"])
         for reply in agent.handle_event(ev):
-            send_message(ev["address"], reply["text"], reply.get("buttons"))
+            try:
+                send_message(ev["address"], reply["text"], reply.get("buttons"))
+            except Exception:
+                # The reply matters (it may be a match/flag notice):
+                # queue it for the next delivery instead of losing it
+                # to a transient send failure.
+                store.enqueue_outbox(
+                    owner_id, "whatsapp", ev["address"],
+                    reply["text"], reply.get("buttons"),
+                )
     # Deliver anything the agent owes other users (match/flag notices).
-    for row in store.drain_outbox(channel="whatsapp"):
-        send_message(row["address"], row["text"], row["buttons"])
+    # Peek + mark-after-send: a failed send stays queued for next time
+    # instead of being marked sent and lost.
+    for row in store.peek_outbox(channel="whatsapp"):
+        try:
+            send_message(row["address"], row["text"], row["buttons"])
+        except Exception:
+            continue
+        store.mark_outbox_sent([row["id"]])
     return {"status": "ok"}

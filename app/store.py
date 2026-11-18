@@ -575,6 +575,70 @@ def mark_ingested(owner_id, dedupe_key, kind=""):
         return cur.rowcount > 0
 
 
+def release_ingested(owner_id, dedupe_key):
+    """Undo a dedupe mark after a failed processing attempt.
+
+    Webhook dedupe is recorded before the agent runs (so a platform
+    retry of a *successful* delivery is a no-op). If processing itself
+    raised, the message was never actually handled — releasing the key
+    lets the platform's retry process it for real instead of the retry
+    being swallowed as a duplicate.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM ingested_keys WHERE owner_id = ? AND dedupe_key = ?",
+            (owner_id, dedupe_key),
+        )
+
+
+def recent_signals(owner_id, limit=5):
+    """The owner's most recently stored signals, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE owner_id = ? ORDER BY id DESC LIMIT ?",
+            (owner_id, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_last_signal(owner_id, identifier_hash=None):
+    """Delete the owner's most recent signal (the agent's 'undo').
+
+    Only the newest entry of its (owner, person) stream is ever removed:
+    that entry is the stream's chain tip, so deleting it leaves the
+    remaining evidence chain intact (deleting a middle entry would
+    break the link after it, by design). The matching pair message —
+    the same snippet, time and direction written alongside the signal —
+    is removed with it. Returns the deleted signal row, or None.
+    """
+    query = "SELECT * FROM signals WHERE owner_id = ?"
+    params = [owner_id]
+    if identifier_hash:
+        query += " AND identifier_hash = ?"
+        params.append(identifier_hash)
+    query += " ORDER BY id DESC LIMIT 1"
+    with _connect() as conn:
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM signals WHERE id = ?", (row["id"],))
+        pair = conn.execute(
+            "SELECT id FROM pair_messages WHERE owner_id = ? "
+            "AND partner_hash = ? AND direction = 'in' "
+            "AND message_snippet = ? AND sent_at = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (
+                owner_id,
+                row["identifier_hash"],
+                row["message_snippet"],
+                row["sent_at"],
+            ),
+        ).fetchone()
+        if pair is not None:
+            conn.execute("DELETE FROM pair_messages WHERE id = ?", (pair["id"],))
+    return dict(row)
+
+
 def add_notice(owner_id, notice_key):
     """Record that a notice was sent. Returns True the first time only."""
     with _connect() as conn:
@@ -595,8 +659,12 @@ def enqueue_outbox(owner_id, channel, address, text, buttons=None):
         return cur.lastrowid
 
 
-def drain_outbox(channel=None, owner_id=None):
-    """Fetch and mark-sent pending outbox rows (optionally filtered)."""
+def peek_outbox(channel=None, owner_id=None):
+    """Pending outbox rows WITHOUT marking them sent.
+
+    Transports use peek + mark_outbox_sent so a failed send leaves the
+    notice queued for the next delivery instead of losing it.
+    """
     query = "SELECT * FROM outbox WHERE sent_at IS NULL"
     params = []
     if channel:
@@ -608,16 +676,29 @@ def drain_outbox(channel=None, owner_id=None):
     query += " ORDER BY id"
     with _connect() as conn:
         rows = conn.execute(query, params).fetchall()
-        for row in rows:
-            conn.execute(
-                "UPDATE outbox SET sent_at = datetime('now') WHERE id = ?",
-                (row["id"],),
-            )
     out = []
     for row in rows:
         item = dict(row)
         item["buttons"] = _json.loads(item["buttons"] or "[]")
         out.append(item)
+    return out
+
+
+def mark_outbox_sent(row_ids):
+    """Mark outbox rows delivered — call only after the send succeeded."""
+    if not row_ids:
+        return
+    with _connect() as conn:
+        conn.executemany(
+            "UPDATE outbox SET sent_at = datetime('now') WHERE id = ?",
+            [(row_id,) for row_id in row_ids],
+        )
+
+
+def drain_outbox(channel=None, owner_id=None):
+    """Fetch and mark-sent pending outbox rows (optionally filtered)."""
+    out = peek_outbox(channel=channel, owner_id=owner_id)
+    mark_outbox_sent([row["id"] for row in out])
     return out
 
 

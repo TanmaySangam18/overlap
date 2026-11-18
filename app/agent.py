@@ -40,6 +40,49 @@ _DONE_BUTTON = {"id": "onboarding:done", "title": "Done — that's all"}
 
 _YES = {"yes", "agree", "ok", "okay", "yes please", "turn it on"}
 
+
+def _norm(text):
+    """Normalize a typed command for intent matching.
+
+    People type like people: 'Thanks!', 'YES please', 'who are you
+    watching??'. Matching on the raw string made the agent feel deaf —
+    the leading chat agents (Series, Yuki, Poke) all understand loose
+    phrasing. Lowercase, drop punctuation/emoji, collapse spaces. Used
+    ONLY for command/intent matching — names and message text are
+    always handled raw.
+    """
+    cleaned = re.sub(r"[^a-z0-9\s']", " ", (text or "").lower())
+    return " ".join(cleaned.split())
+
+
+_STATUS_WORDS = {
+    "status", "who are you watching", "what are you watching",
+    "who am i watching", "show my people", "my people", "list people",
+    "watching", "show status",
+}
+_ACTIVITY_WORDS = {
+    "activity", "recent", "history", "my activity", "show activity",
+    "what have you logged", "what did you log", "what's logged",
+    "whats logged",
+}
+_EVIDENCE_WORDS = {"evidence", "proof", "show evidence", "show proof", "my evidence"}
+_UNDO_WORDS = {
+    "undo", "undo last", "undo that", "delete last", "remove last",
+    "delete that", "remove that", "take that back",
+}
+_PAUSE_WORDS = {"pause", "pause watching", "stop watching", "stop"}
+_RESUME_WORDS = {"resume", "resume watching", "start watching", "unpause"}
+_FORGET_WORDS = {
+    "forget me", "delete my data", "delete everything",
+    "forget everything", "delete me",
+}
+_HELP_WORDS = {"help", "hi", "hello", "hey", "menu", "commands", "start"}
+_PASTE_LOG_WORDS = {"log it", "log", "file it", "yes log it"}
+_PASTE_TALK_WORDS = {
+    "just talking", "talk", "don't log it", "dont log it",
+    "do not log it", "just talk",
+}
+
 # Plain typed text is conversation with the agent, never a log entry —
 # only forwards, exports and screenshots are evidence. These sets shape
 # the conversational replies; the chat-shape check below decides when a
@@ -113,17 +156,26 @@ def handle_event(ev):
 
     # Platform retries must not double-ingest.
     message_id = ev.get("message_id")
-    if message_id:
-        if not store.mark_ingested(owner_id, f"msg_{channel}_{message_id}", "webhook"):
+    dedupe_key = f"msg_{channel}_{message_id}" if message_id else None
+    if dedupe_key:
+        if not store.mark_ingested(owner_id, dedupe_key, "webhook"):
             return []
 
-    if not user["consented_at"]:
-        return _pre_consent(owner_id, ev)
-    return _consented(owner_id, user, ev)
+    try:
+        if not user["consented_at"]:
+            return _pre_consent(owner_id, ev)
+        return _consented(owner_id, user, ev)
+    except Exception:
+        # Processing failed, so this delivery was never actually
+        # handled: release the dedupe mark so the platform's retry
+        # processes the message instead of being swallowed as a dup.
+        if dedupe_key:
+            store.release_ingested(owner_id, dedupe_key)
+        raise
 
 
 def _pre_consent(owner_id, ev):
-    text = (ev.get("text") or "").strip().lower()
+    text = _norm(ev.get("text") or "")
     if ev.get("button_id") == "consent:yes" or (ev["kind"] == "text" and text in _YES):
         store.set_consent(owner_id)
         store.set_agent_state(owner_id, "onboarding_cards", {})
@@ -156,6 +208,11 @@ def _pre_consent(owner_id, ev):
         cannot_read = (
             "You send things to me here — I never read your other chats "
             "(a Telegram bot can't see them — only what you send me here)."
+        )
+    elif channel == "sms":
+        cannot_read = (
+            "You send things to me here — I never read your other chats "
+            "(a texting agent can't see them — only what you send me here)."
         )
     else:
         cannot_read = (
@@ -226,29 +283,57 @@ def _consented(owner_id, user, ev):
     if kind == "contact":
         return _register_contact(owner_id, ev.get("contact") or {})
     if kind == "document":
+        doc_state = store.get_agent_state(owner_id)
+        if doc_state["context"].get("paused"):
+            return [_paused_reply()]
         return _handle_export(owner_id, user, ev.get("document_bytes") or b"")
 
     # text / forwarded
     text = (ev.get("text") or "").strip()
     low = text.lower()
+    cmd = _norm(text)
     state = store.get_agent_state(owner_id)
     ctx = state["context"]
 
     if (
         state["state"] == "onboarding_cards"
         and not ctx.get("pending_review")
-        and low in ("done", "skip", "that's all", "that's it", "no more", "skip for now")
+        and cmd in ("done", "skip", "that's all", "that's it", "no more", "skip for now")
     ):
         return _finish_onboarding(owner_id)
 
-    if low == "forget me":
+    if cmd in _FORGET_WORDS:
         store.delete_owner_data(owner_id)
         return [{"text": "Done — everything I held for you is deleted.", "buttons": []}]
-    if low == "status":
+    if cmd in _STATUS_WORDS:
         return [_status(owner_id)]
-    if low in ("evidence", "proof"):
+    if cmd in _ACTIVITY_WORDS:
+        return [_activity_report(owner_id)]
+    if cmd in _EVIDENCE_WORDS:
         return [_evidence_report(owner_id)]
-    if low in ("help", "hi", "hello", "hey"):
+    if cmd in _UNDO_WORDS or cmd.startswith(("undo ", "delete last for ", "remove last for ")):
+        return _undo_last(owner_id, cmd)
+    if cmd in _RESUME_WORDS:
+        ctx["paused"] = False
+        store.set_agent_state(owner_id, state["state"], ctx)
+        return [
+            {
+                "text": "Watching again ✓ Forward messages whenever — "
+                "I'll log them as they come.",
+                "buttons": [],
+            }
+        ]
+    if cmd in _PAUSE_WORDS:
+        ctx["paused"] = True
+        store.set_agent_state(owner_id, state["state"], ctx)
+        return [
+            {
+                "text": "Paused ✓ I won't log anything new until you say "
+                "'resume'. Your saved people and history stay as they are.",
+                "buttons": [],
+            }
+        ]
+    if cmd in _HELP_WORDS:
         return [
             {
                 "text": (
@@ -258,7 +343,9 @@ def _consented(owner_id, user, ev):
                     "• a chat export file for their history + baseline\n"
                     "Anything you type to me is just conversation — I only "
                     "log forwards, exports and screenshots.\n"
-                    "Say 'status' for what I'm watching, 'forget me' to delete "
+                    "Say 'status' for what I'm watching, 'activity' for your "
+                    "latest entries, 'undo' to remove the last one, 'pause' "
+                    "to stop logging for a while, 'forget me' to delete "
                     "your data."
                 ),
                 "buttons": [],
@@ -266,13 +353,20 @@ def _consented(owner_id, user, ev):
         ]
     if state["state"] == "awaiting_whoami" and low.startswith("i am "):
         return _resolve_whoami(owner_id, user, text[5:].strip())
-    if ctx.get("pending_review") and low in ("confirm", "dismiss"):
-        return _apply_review(owner_id, ctx["pending_review"], low)
+    if ctx.get("pending_review") and cmd in ("confirm", "dismiss"):
+        return _apply_review(owner_id, ctx["pending_review"], cmd)
+    if kind == "text" and ctx.get("pending_paste"):
+        if cmd in _PASTE_LOG_WORDS:
+            return _resolve_paste(owner_id, log=True)
+        if cmd in _PASTE_TALK_WORDS:
+            return _resolve_paste(owner_id, log=False)
+    if ctx.get("paused") and kind == "forwarded":
+        return [_paused_reply()] 
     if state["state"] == "awaiting_attribution":
         person = _find_person_for_name(owner_id, text)
         if person:
             return _attribute_pending(owner_id, person)
-        if low in ("new", "new person", "someone new"):
+        if cmd in ("new", "new person", "someone new"):
             store.set_agent_state(owner_id, "awaiting_contact", ctx)
             return [
                 {
@@ -309,6 +403,7 @@ def _conversation(owner_id, ev):
     """
     text = (ev.get("text") or "").strip()
     low = text.lower()
+    cmd = _norm(text)
     state = store.get_agent_state(owner_id)
     ctx = state["context"]
     if _looks_like_chat(text):
@@ -329,7 +424,7 @@ def _conversation(owner_id, ev):
                 ],
             }
         ]
-    if low in _ACKS:
+    if cmd in _ACKS or cmd.startswith("thank"):
         return [
             {
                 "text": "Anytime. Forward me their messages whenever — "
@@ -337,7 +432,19 @@ def _conversation(owner_id, ev):
                 "buttons": [],
             }
         ]
-    if low.endswith("?") or (low.split(" ", 1)[0] if low else "") in _QUESTION_STARTERS:
+    if "cheat" in cmd:
+        return [
+            {
+                "text": "I can't tell you that — and I never will. I only "
+                "see the pattern of what you send me: how often, how late, "
+                "how it changes against that pair's own baseline. Pattern "
+                "changes, never verdicts. If a change ever looks worth "
+                "your attention, I'll show you exactly what changed and "
+                "you decide what it means.",
+                "buttons": [],
+            }
+        ]
+    if low.endswith("?") or (cmd.split(" ", 1)[0] if cmd else "") in _QUESTION_STARTERS:
         return [
             {
                 "text": "I watch what you send me: share a person's "
@@ -378,34 +485,118 @@ def _handle_button(owner_id, button_id):
     if button_id == "consent:yes":
         return _pre_consent(owner_id, {"kind": "button", "button_id": "consent:yes", "text": ""})
     if button_id == "paste:log":
-        state = store.get_agent_state(owner_id)
-        ctx = state["context"]
-        paste = ctx.pop("pending_paste", None)
-        store.set_agent_state(owner_id, state["state"], ctx)
-        if not paste:
-            return [
-                {
-                    "text": "Nothing waiting to log — paste it again and "
-                    "tap Log it.",
-                    "buttons": [],
-                }
-            ]
-        return _submit_message(
-            owner_id,
-            {
-                "channel": paste.get("channel", "whatsapp"),
-                "kind": "forwarded",
-                "text": paste["text"],
-                "sent_at": paste["sent_at"],
-            },
-        )
+        return _resolve_paste(owner_id, log=True)
     if button_id == "paste:talk":
-        state = store.get_agent_state(owner_id)
-        ctx = state["context"]
-        ctx.pop("pending_paste", None)
-        store.set_agent_state(owner_id, state["state"], ctx)
-        return [{"text": "Got it — just between us. Nothing logged.", "buttons": []}]
+        return _resolve_paste(owner_id, log=False)
     return [{"text": "Got it.", "buttons": []}]
+
+
+def _resolve_paste(owner_id, log):
+    """File or discard a staged chat paste (button tap or typed reply)."""
+    state = store.get_agent_state(owner_id)
+    ctx = state["context"]
+    paste = ctx.pop("pending_paste", None)
+    store.set_agent_state(owner_id, state["state"], ctx)
+    if not log:
+        return [{"text": "Got it — just between us. Nothing logged.", "buttons": []}]
+    if not paste:
+        return [
+            {
+                "text": "Nothing waiting to log — paste it again and "
+                "tap Log it.",
+                "buttons": [],
+            }
+        ]
+    return _submit_message(
+        owner_id,
+        {
+            "channel": paste.get("channel", "whatsapp"),
+            "kind": "forwarded",
+            "text": paste["text"],
+            "sent_at": paste["sent_at"],
+        },
+    )
+
+
+def _paused_reply():
+    return {
+        "text": "I'm paused, so I didn't log that. Say 'resume' and "
+        "forward it again when you want me watching.",
+        "buttons": [],
+    }
+
+
+def _undo_last(owner_id, cmd):
+    """'undo' / 'undo <name>' / 'delete last for <name>': remove the
+    newest logged message (optionally only from one person's stream).
+
+    Misattribution happens — a forward filed under the wrong person, a
+    screenshot that caught the user's own words. An agent that can log
+    must be able to un-log; Yuki-style agents treat undo + an activity
+    log as table stakes, and here it is also an accuracy feature.
+    """
+    person = None
+    for prefix in ("undo ", "delete last for ", "remove last for "):
+        if cmd.startswith(prefix):
+            person = _find_person_for_name(owner_id, cmd[len(prefix):].strip())
+            if person is None:
+                return [
+                    {
+                        "text": "I don't have anyone saved by that name, "
+                        "so nothing was removed. Say 'status' to see who "
+                        "I'm watching.",
+                        "buttons": [],
+                    }
+                ]
+            break
+    row = store.delete_last_signal(
+        owner_id, person["identifier_hash"] if person else None
+    )
+    if row is None:
+        whose = f" for {person['label']}" if person else ""
+        return [
+            {
+                "text": f"Nothing to undo — I haven't logged anything{whose} yet.",
+                "buttons": [],
+            }
+        ]
+    if person is None:
+        person = store.person_by_hash(owner_id, row["identifier_hash"])
+    label = person["label"] if person else row["identifier_masked"]
+    snippet = (row["message_snippet"] or "")[:40]
+    return [
+        {
+            "text": f"Removed the last logged message for {label}: "
+            f"\"{snippet}\" — gone from the record and the evidence "
+            "chain. Forward it again if that was a mistake.",
+            "buttons": [],
+        }
+    ]
+
+
+def _activity_report(owner_id):
+    """'activity': the user's latest stored entries — their own data.
+
+    The activity log is what makes an agent trustworthy (Yuki shows
+    one; Series keeps conversation history): the user can always see
+    exactly what the agent holds, newest first.
+    """
+    rows = store.recent_signals(owner_id, limit=5)
+    if not rows:
+        return {
+            "text": "Nothing logged yet. Forward me a message from "
+            "someone you're watching and it will show up here.",
+            "buttons": [],
+        }
+    lines = ["Your latest entries (only you can see these):"]
+    for row in rows:
+        person = store.person_by_hash(owner_id, row["identifier_hash"])
+        label = person["label"] if person else row["identifier_masked"]
+        when = (row["sent_at"] or "")[:16].replace("T", " ")
+        snippet = (row["message_snippet"] or "")[:40]
+        lines.append(f"• {label} · {row['source']} · {when} — \"{snippet}\"")
+    lines.append("Say 'undo' if the last one was filed wrong.")
+    return {"text": "\n".join(lines), "buttons": []}
 
 
 # ---------------------------------------------------------------------------
@@ -1058,7 +1249,10 @@ def _status(owner_id):
             "card (attach → Contact) to start — once per person, ever.",
             "buttons": [],
         }
-    lines = ["Watching for you:"]
+    state = store.get_agent_state(owner_id)
+    paused = state["context"].get("paused")
+    lines = ["Watching for you (paused — say 'resume' to log again):" if paused
+             else "Watching for you:"]
     for person in persons:
         pair = store.get_pair_state(owner_id, person["identifier_hash"])
         extra = ""
@@ -1069,5 +1263,13 @@ def _status(owner_id):
         owners = {s["owner_id"] for s in store.signals_for_hash(person["identifier_hash"])}
         if len(owners) >= 2:
             extra += " — potential overlap found"
+        stream = store.signals_for_stream(owner_id, person["identifier_hash"])
+        if stream:
+            last = max(s["sent_at"] for s in stream)[:10]
+            extra += f" · {len(stream)} logged · last {last}"
+        else:
+            extra += " · nothing logged yet"
         lines.append(f"• {person['label']} ({person['identifier_masked']}){extra}")
+    lines.append("Say 'activity' for the latest entries, 'undo' to remove "
+                 "the last one.")
     return {"text": "\n".join(lines), "buttons": []}

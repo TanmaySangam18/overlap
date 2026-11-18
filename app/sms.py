@@ -38,6 +38,10 @@ def _render(reply) -> str:
         elif any(i.startswith("attr:") for i in ids):
             names = " / ".join(b["title"] for b in buttons)
             text += f"\n(Reply with the name: {names})"
+        elif any(i.startswith("paste:") for i in ids):
+            text += "\n(Reply LOG IT or JUST TALKING)"
+        elif any(i == "onboarding:done" for i in ids):
+            text += "\n(Reply DONE or SKIP)"
         elif any(i == "consent:yes" for i in ids):
             text += "\n(Reply YES)"
     return text

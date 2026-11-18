@@ -261,9 +261,22 @@ async def receive(request: Request):
             "instead, or use the Telegram client for automatic capture.",
         )
         return {"status": "ok"}
+    owner_id = store.owner_id_for_address("telegram", ev["address"])
     for reply in agent.handle_event(ev):
-        send_message(ev["address"], reply["text"], reply.get("buttons"))
+        try:
+            send_message(ev["address"], reply["text"], reply.get("buttons"))
+        except Exception:
+            store.enqueue_outbox(
+                owner_id, "telegram", ev["address"],
+                reply["text"], reply.get("buttons"),
+            )
     # Deliver anything the agent owes other users (match/flag notices).
-    for row in store.drain_outbox(channel="telegram"):
-        send_message(row["address"], row["text"], row["buttons"])
+    # Peek + mark-after-send, same as WhatsApp: a failed send stays
+    # queued instead of being marked sent and lost.
+    for row in store.peek_outbox(channel="telegram"):
+        try:
+            send_message(row["address"], row["text"], row["buttons"])
+        except Exception:
+            continue
+        store.mark_outbox_sent([row["id"]])
     return {"status": "ok"}
