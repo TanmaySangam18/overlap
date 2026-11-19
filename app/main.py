@@ -264,6 +264,11 @@ def home():
     return FileResponse(_WEB_INDEX)
 
 
+@app.get("/cafe-bg.jpg")
+def cafe_bg():
+    return FileResponse(_WEB_INDEX.parent / "cafe-bg.jpg", media_type="image/jpeg")
+
+
 @app.get("/cafe-loop.mp4")
 def cafe_loop():
     """The landing page's looping café backdrop video."""
