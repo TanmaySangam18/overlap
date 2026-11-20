@@ -250,9 +250,12 @@ def test_full_story_match_flag_review(media):
     flag_text = next(
         rec["text"] for rec in wa.DRY_RUN_LOG if "Pattern change" in rec["text"]
     )
-    assert "Frequency jumped" in flag_text
-    assert "Late-night share rose" in flag_text
+    assert "several times more often" in flag_text or "many times more often" in flag_text
+    assert "Much more late-night messaging" in flag_text
     assert "Affectionate language is new" not in flag_text
+    # Bands, not exact numbers (launch decision): no counts in flag copy.
+    assert "messages/week" not in flag_text
+    assert "1.4" not in flag_text
 
     # No review yet -> API alert is blocked.
     match_id = f"match_{PETER_HASH[:16]}"
