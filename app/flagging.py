@@ -118,28 +118,23 @@ def evaluate(owner_id: str, partner_identifier: str, since_iso: str, partner_ide
 
         reasons = []
         if freq_jump:
-            reasons.append(
-                f"Frequency jumped from {b['per_week']:.1f} to {a['per_week']:.1f} "
-                f"messages/week ({freq_ratio:.1f}x)."
-            )
+            # Bands, not exact numbers (launch decision, 2026-11-19):
+            # the flag shows the pattern, never the other person's
+            # exact message counts. Thresholds still use the numbers
+            # internally; only the wording is coarsened.
+            if freq_ratio >= 6.0:
+                reasons.append("Messages became many times more often than before.")
+            else:
+                reasons.append("Messages became several times more often than before.")
         if late_delta >= MIN_LATE_NIGHT_DELTA:
-            reasons.append(
-                f"Late-night share rose from {b['late_share']:.0%} to "
-                f"{a['late_share']:.0%}."
-            )
+            reasons.append("Much more late-night messaging than before.")
         if affection_new:
-            reasons.append(
-                f"Affectionate language is new for this pair: {b['affection_rate']:.0%} "
-                f"of messages before, {a['affection_rate']:.0%} after."
-            )
+            reasons.append("Affectionate language is new for this pair.")
 
         flagged = bool(freq_jump and (late_delta >= MIN_LATE_NIGHT_DELTA or affection_new))
         if not flagged:
             if not freq_jump:
-                reasons.append(
-                    f"No frequency jump: {b['per_week']:.1f} -> {a['per_week']:.1f} "
-                    "messages/week."
-                )
+                reasons.append("No sharp rise in frequency.")
             elif not reasons:
                 reasons.append("Frequency rose, but no timing or affection change.")
         reports.append(
